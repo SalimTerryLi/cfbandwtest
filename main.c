@@ -8,11 +8,17 @@
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <curl/curl.h>
 
 #define log(format, ...) fprintf (stderr, format, ##__VA_ARGS__)
 #define output(format, ...) fprintf (stdout, format, ##__VA_ARGS__)
+
+// compile-time configuration
+#define SPEED_CHECK_PERIOD_MS 1000
+#define SPEED_CHECK_ACCEPT_COUNT 5
+#define SPEED_CHECK_MIN_DIFF 0.1l
 
 // run-time configuration
 static uint16_t parallel_count = 1;
@@ -20,9 +26,9 @@ static uint16_t max_test_period_s = 15;
 static uint16_t max_in_band_mBs = 0;
 static char *remote_file_url_p = NULL;
 
-int test_band();
+static int test_band();
 
-void print_help(const char *execname) {
+static void print_help(const char *execname) {
     log("%s [options] file-url\n", execname);
     log("Designed to fetch a large file from the provided URL, with underlying TCP connection to different IPs\n");
     log("So that multiple CDN IPs can be tested conveniently to find out which works better\n");
@@ -36,7 +42,7 @@ void print_help(const char *execname) {
     log("  -b n     max available incoming bandwidth in MB/s, must be provided if parallel count greater than 1\n\n");
 }
 
-char *readline(char *recv_buf, size_t size, int fd) {
+static char *readline(char *recv_buf, size_t size, int fd) {
     size_t buf_idx = 0;
     while (buf_idx < size) {
         long rd_len = read(0, recv_buf + buf_idx, 1);
@@ -62,6 +68,12 @@ char *readline(char *recv_buf, size_t size, int fd) {
     }
     log("buf too small\n");
     return NULL;
+}
+
+static uint64_t get_timestamp() {
+    struct timespec spec;
+    clock_gettime(CLOCK_REALTIME, &spec);
+    return spec.tv_nsec / 1000000 + spec.tv_sec * 1000;
 }
 
 int main(int argc, char** argv) {
@@ -135,7 +147,78 @@ int main(int argc, char** argv) {
     return ret;
 }
 
-int test_band() {
+typedef struct {
+    CURL *req_hdl;
+    struct curl_slist *connect_to;
+    bool is_running;
+    // below is used to calculate band
+    uint64_t begin_timestamp;           // will only be filled on startup
+    uint16_t accept_count;              // accepted count of available bandwidth
+    uint32_t max_bandw_kbs;             // recorded maximum bandwidth
+    uint32_t speed_up_period_ms;        // time period of bandwidth increasing
+    uint32_t avg_bandwidth_kbs;         // average bandwidth
+    // below is used to provide estimated transfer speed
+    uint64_t last_checked_timestamp;
+    uint64_t last_transfered_size_B;
+    uint64_t total_transfered_size_B;
+} task_handler_t;
+
+static task_handler_t *hdls = NULL;
+
+static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    task_handler_t *hdl = (task_handler_t*) userdata;
+    hdl->last_transfered_size_B += nmemb;
+    return nmemb;
+}
+
+static bool update_bandwidth_calc(task_handler_t *task, uint64_t curr_timestamp) {
+    task->total_transfered_size_B += task->last_transfered_size_B;
+    uint32_t measured_bandwidth_kbs_curr = task->last_transfered_size_B / 1024 * 1000 / SPEED_CHECK_PERIOD_MS;
+    log("%s curr band: %ukb/s, max=%ukb/s\n",
+        task->connect_to->data,
+        measured_bandwidth_kbs_curr,
+        task->max_bandw_kbs
+        );
+    if (measured_bandwidth_kbs_curr > task->max_bandw_kbs) {
+        if (measured_bandwidth_kbs_curr > task->max_bandw_kbs * (1 + SPEED_CHECK_MIN_DIFF)) {
+            // only reset counter if incremental is great enough
+            task->accept_count = 0;
+            task->avg_bandwidth_kbs = 0;
+        }
+        task->max_bandw_kbs = measured_bandwidth_kbs_curr;
+    } else {
+        ++task->accept_count;
+        if (task->accept_count == 1) {
+            task->speed_up_period_ms = curr_timestamp - task->begin_timestamp;
+        } else if (task->accept_count == SPEED_CHECK_ACCEPT_COUNT) {
+            // end of measurement.
+            return true;
+        }
+        // update average bandwidth
+        task->avg_bandwidth_kbs = (uint32_t)((double)task->avg_bandwidth_kbs * (task->accept_count - 1) / task->accept_count
+                                             + (double)measured_bandwidth_kbs_curr * 1 / task->accept_count);
+    }
+
+    if (curr_timestamp - task->begin_timestamp >= max_test_period_s * 1000) {
+        if (task->avg_bandwidth_kbs == 0) {
+            task->avg_bandwidth_kbs = (uint32_t)(task->max_bandw_kbs * (1 - SPEED_CHECK_MIN_DIFF));
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static int test_band() {
+    output("%s\t\t%s\t%s\t%s\t%s\t%s\n",
+           "TARGET",
+           "AVG",
+           "MAX",
+           "SPEEDUP",
+           "TOTAL",
+           "ERRRFLAG"
+    );
+
     CURLMcode curlm_code;
     CURLcode curle_code;
 
@@ -151,13 +234,7 @@ int test_band() {
         goto err_multi_init;
     }
 
-    typedef struct {
-        CURL *req_hdl;
-        struct curl_slist *connect_to;
-        bool is_running;
-    } task_handler_t;
-
-    task_handler_t *hdls = malloc(sizeof(task_handler_t) * parallel_count);
+    hdls = malloc(sizeof(task_handler_t) * parallel_count);
     memset(hdls, 0, sizeof(task_handler_t) * parallel_count);
     if (hdls == NULL) {
         log("failed to malloc task_handlers: %s\n", strerror(errno));
@@ -171,6 +248,10 @@ int test_band() {
         }
         // configure opts in advance
         assert(curl_easy_setopt(hdl->req_hdl, CURLOPT_URL, remote_file_url_p) == CURLE_OK);
+        // configure callback in advance
+        assert(curl_easy_setopt(hdl->req_hdl, CURLOPT_WRITEFUNCTION, write_callback) == CURLE_OK);
+        // configure corresponding userdata
+        assert(curl_easy_setopt(hdl->req_hdl, CURLOPT_WRITEDATA, (void*)hdl) == CURLE_OK);
         hdl->is_running = false;
     }
 
@@ -193,22 +274,77 @@ int test_band() {
             FD_SET(0, &curl_rd_fdset);
             FD_SET(0, &curl_er_fdset);
         }
-
-        // do select
+        // always assume stdin is available for polling
         if (curl_max_fd == -1) {
             curl_max_fd = 1;
         }
+
+        // setup timeout
         struct timeval timeout;
-        struct timeval *timeout_p = NULL;
-        long timeo;
-        assert(curl_multi_timeout(curl_hdl, &timeo) == CURLM_OK);
-        if(timeo < 0) {
-            //
+        struct timeval *timeout_p = NULL;       // default no timeout
+        long timeout_curl;
+        long timeout_tasks = LONG_MAX;
+        assert(curl_multi_timeout(curl_hdl, &timeout_curl) == CURLM_OK);
+        {
+            // hide vars
+            uint64_t curr_ts = get_timestamp();
+            // check and update all tasks' timeout
+            for (task_handler_t *hdl = hdls; hdl < hdls + parallel_count; ++hdl) {
+                if (hdl->is_running) {
+                    long this_task_elapsed = (long)(curr_ts - hdl->last_checked_timestamp);
+                    long this_task_timeout = this_task_elapsed >= SPEED_CHECK_PERIOD_MS? 0: SPEED_CHECK_PERIOD_MS - this_task_elapsed;
+                    // also do bandwidth calc here
+                    if (this_task_elapsed >= SPEED_CHECK_PERIOD_MS) {
+                        if (update_bandwidth_calc(hdl, curr_ts)) {
+                            hdl->connect_to->data[strlen(hdl->connect_to->data)-1] = '\0';
+                            log("<--test complete: target=%s\n", hdl->connect_to->data + 2);
+                            output("%s\t%u\t%u\t%u\t%lu\n",
+                                   hdl->connect_to->data + 2,
+                                   hdl->avg_bandwidth_kbs,
+                                   hdl->max_bandw_kbs,
+                                   hdl->speed_up_period_ms,
+                                   hdl->total_transfered_size_B / 1024
+                                   );
+                            // cleanup finished task
+                            curl_slist_free_all(hdl->connect_to);
+                            hdl->connect_to = NULL;
+                            hdl->is_running = false;
+                            curl_multi_remove_handle(curl_hdl, hdl->req_hdl);
+                            ++spare_hdl_count;
+                        } else {
+                            hdl->last_checked_timestamp = curr_ts;
+                            hdl->last_transfered_size_B = 0;
+                        }
+                    }
+                    // find out the shortest timeout
+                    if (this_task_timeout < timeout_tasks) {
+                        timeout_tasks = this_task_timeout;
+                    }
+                }
+            }
+            // so that if any task is running, timeout_tasks will be filled with a timeout that is nearest to the next checkpoint
+        }
+        if (timeout_curl < 0 && timeout_tasks == LONG_MAX) {
+            // no timeout is expected. do nothing and select forever
+        } else if (timeout_curl >= 0 && timeout_tasks == LONG_MAX) {
+            // only curl is requesting timeout
+            timeout.tv_sec = timeout_curl / 1000;
+            timeout.tv_usec = (timeout_curl % 1000) * 1000;
+            timeout_p = &timeout;
+        } else if (timeout_curl < 0 && timeout_tasks != LONG_MAX) {
+            // only tasks is requesting timeout
+            timeout.tv_sec = timeout_tasks / 1000;
+            timeout.tv_usec = (timeout_tasks % 1000) * 1000;
+            timeout_p = &timeout;
         } else {
-            timeout.tv_sec = timeo / 1000;
-            timeout.tv_usec = (timeo % 1000) * 1000;
+            // both are requesting a value
+            timeout_curl = timeout_curl > timeout_tasks? timeout_curl: timeout_tasks;
+            timeout.tv_sec = timeout_curl / 1000;
+            timeout.tv_usec = (timeout_curl % 1000) * 1000;
             timeout_p = &timeout;
         }
+
+        // select!
         int sel_ret = select(curl_max_fd +1, &curl_rd_fdset, &curl_wr_fdset, &curl_er_fdset, timeout_p);
         if (sel_ret == -1) {
             log("select() error: %s\n", strerror(errno));
@@ -246,6 +382,21 @@ int test_band() {
                     if (msg->msg == CURLMSG_DONE) {
                         if (msg->data.result != CURLE_OK) {
                             log("!--error task idx=%ld: %s\n", curr_hdl - hdls, curl_easy_strerror(msg->data.result));
+                            output("%s\t%u\t%u\t%u\t%lu\tERROR\n",
+                                   curr_hdl->connect_to->data + 2,
+                                   curr_hdl->avg_bandwidth_kbs,
+                                   curr_hdl->max_bandw_kbs,
+                                   curr_hdl->speed_up_period_ms,
+                                   curr_hdl->total_transfered_size_B / 1024
+                            );
+                        } else {
+                            output("%s\t%u\t%u\t%u\t%lu\tEARLY_CLOSE\n",
+                                   curr_hdl->connect_to->data + 2,
+                                   curr_hdl->avg_bandwidth_kbs,
+                                   curr_hdl->max_bandw_kbs,
+                                   curr_hdl->speed_up_period_ms,
+                                   curr_hdl->total_transfered_size_B / 1024
+                            );
                         }
                     } else {
                         log("E: CURLMsg (%d)\n", msg->msg);
@@ -256,10 +407,9 @@ int test_band() {
                     curr_hdl->is_running = false;
                     curl_multi_remove_handle(curl_hdl, curr_hdl->req_hdl);
                     ++spare_hdl_count;
-                    log("<--task %ld exited. remain %lu working tasks\n", curr_hdl - hdls, parallel_count - spare_hdl_count);
                 }
-            } else {
-                // deal with curl provided timout. May over-call but that doesn't matter
+            } else if (sel_ret == 0 && !update_stdin_input) {
+                // deal with curl provided timout.
                 assert(curl_multi_perform(curl_hdl, &still_running) == CURLM_OK);
             }
 
@@ -288,6 +438,14 @@ int test_band() {
                     char ip_format[128];
                     snprintf(ip_format, sizeof(ip_format), "::%s:", buf);
                     next_hdl->connect_to = curl_slist_append(NULL, ip_format);
+                    next_hdl->accept_count = 0;
+                    next_hdl->avg_bandwidth_kbs = 0;
+                    next_hdl->max_bandw_kbs = 0;
+                    next_hdl->speed_up_period_ms = 0;
+                    next_hdl->last_checked_timestamp = get_timestamp();
+                    next_hdl->begin_timestamp = next_hdl->last_checked_timestamp;
+                    next_hdl->last_transfered_size_B = 0;
+                    next_hdl->total_transfered_size_B = 0;
                     assert(curl_easy_setopt(next_hdl->req_hdl, CURLOPT_CONNECT_TO, (char*)next_hdl->connect_to) == CURLE_OK);
                     assert(curl_multi_add_handle(curl_hdl, next_hdl->req_hdl) == CURLM_OK);
                     assert(curl_multi_perform(curl_hdl, &still_running) == CURLM_OK);

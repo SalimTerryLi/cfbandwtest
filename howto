@@ -1,0 +1,1 @@
+cat ../cf_cidr.list | ../create_ip_within_range.py | ./cfbandwtest https://some.site.behind.cf/path/to/uncached/TEST_1GB 2>/dev/null
